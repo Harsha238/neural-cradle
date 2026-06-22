@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Neural Cradle // Hand-Tracked String Art</title>
+
+<!-- p5.js -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.min.js"></script>
+
+<!-- MediaPipe Hands -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+<style>
+  :root{
+    --cyan:#00fff9;
+    --magenta:#ff00e6;
+    --yellow:#fff700;
+  }
+  html,body{
+    margin:0; padding:0; overflow:hidden;
+    width:100%; height:100%;
+    background:#020205;
+    font-family:'Courier New', monospace;
+    -webkit-user-select:none; user-select:none;
+  }
+  #videoElement{
+    position:fixed; top:0; left:0;
+    width:100vw; height:100vh;
+    object-fit:cover;
+    transform:scaleX(-1); /* mirror for natural selfie view */
+    filter:brightness(0.45) contrast(1.25) saturate(1.1);
+    z-index:0;
+  }
+  #vignette{
+    position:fixed; top:0; left:0; width:100vw; height:100vh;
+    z-index:1; pointer-events:none;
+    background:
+      radial-gradient(ellipse at center, rgba(0,0,0,0) 40%, rgba(0,0,0,0.75) 100%),
+      repeating-linear-gradient(0deg, rgba(0,255,255,0.025) 0px, rgba(0,255,255,0.025) 1px, transparent 1px, transparent 3px);
+  }
+  #cradleCanvasWrap{
+    position:fixed; top:0; left:0; z-index:2;
+  }
+  #cradleCanvasWrap canvas{
+    display:block;
+  }
+  #hud{
+    position:fixed; top:0; left:0; width:100vw; height:100vh;
+    z-index:3; pointer-events:none;
+    color:var(--cyan);
+    text-shadow:0 0 8px rgba(0,255,249,0.8);
+  }
+  #hudTitle{
+    position:absolute; top:18px; left:22px;
+    font-size:13px; letter-spacing:3px; opacity:0.85;
+  }
+  #hudTitle span{ color:var(--magenta); text-shadow:0 0 8px rgba(255,0,230,0.8); }
+  #hudStats{
+    position:absolute; top:18px; right:22px;
+    font-size:11px; letter-spacing:1px; text-align:right; line-height:1.6em;
+    opacity:0.9;
+  }
+  .ok{ color:var(--yellow); text-shadow:0 0 8px rgba(255,247,0,0.8); }
+  .wait{ color:#445; text-shadow:none; }
+  #centerMsg{
+    position:absolute; top:50%; left:50%;
+    transform:translate(-50%,-50%);
+    font-size:15px; letter-spacing:2px;
+    text-align:center; width:90vw;
+    transition:opacity 0.4s ease;
+  }
+  #footer{
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    font-size:10px; letter-spacing:2px; opacity:0.5; text-align:center;
+  }
+</style>
+</head>
+<body>
+
+<video id="videoElement" autoplay playsinline muted></video>
+<div id="vignette"></div>
+<div id="cradleCanvasWrap"></div>
+
+<div id="hud">
+  <div id="hudTitle">NEURAL&nbsp;CRADLE <span>// STRING PROTOCOL</span></div>
+  <div id="hudStats">
+    <div id="statL" class="wait">L-HAND :: SEARCHING</div>
+    <div id="statR" class="wait">R-HAND :: SEARCHING</div>
+    <div id="statT" class="wait">TENSION :: --</div>
+  </div>
+  <div id="centerMsg">INITIALIZING CAMERA LINK...</div>
+  <div id="footer">SHOW BOTH HANDS TO WEAVE THE THREAD</div>
+</div>
+
+<script>
+/* =========================================================
+   NEURAL CRADLE
+   MediaPipe Hands -> hand landmarks
+   p5.js           -> glowing neon overlay + elastic strings
+   ========================================================= */
+
+const FINGER_TIPS   = [4, 8, 12, 16, 20];           // thumb, index, middle, ring, pinky
+const HAND_BONES = [
+  [0,1],[1,2],[2,3],[3,4],          // thumb
+  [0,5],[5,6],[6,7],[7,8],          // index
+  [5,9],[9,10],[10,11],[11,12],     // middle
+  [9,13],[13,14],[14,15],[15,16],   // ring
+  [13,17],[17,18],[18,19],[19,20],  // pinky
+  [0,17]                            // palm base
+];
+// Which colour group a landmark index belongs to (0 wrist,1 thumb,2 index,3 middle,4 ring,5 pinky)
+function fingerGroup(i){
+  if(i===0) return 0;
+  if(i<=4)  return 1;
+  if(i<=8)  return 2;
+  if(i<=12) return 3;
+  if(i<=16) return 4;
+  return 5;
+}
+
+const PALETTE = ['#9fd6ff', '#00fff9', '#ff00e6', '#fff700', '#00fff9', '#ff00e6'];
+
+let videoEl;
+let handsModel, mpCamera;
+let latestHands = [];   // array of { lm: [{x,y}], tipsScreen: {idx:{x,y}} }
+let cradleCanvas;
+let started = false;
+let particles = [];
+let touchCooldown = {};
+
+/* ---------- bootstrap ---------- */
+window.addEventListener('load', initApp);
+
+async function initApp(){
+  videoEl = document.getElementById('videoElement');
+
+  handsModel = new Hands({
+    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+  });
+  handsModel.setOptions({
+    maxNumHands: 2,
+    modelComplexity: 1,
+    minDetectionConfidence: 0.65,
+    minTrackingConfidence: 0.65
+  });
+  handsModel.onResults(onHandsResults);
+
+  try{
+    mpCamera = new Camera(videoEl, {
+      onFrame: async () => { await handsModel.send({ image: videoEl }); },
+      width: 640,
+      height: 480
+    });
+    await mpCamera.start();
+    setCenterMsg('LINK ESTABLISHED — RAISE YOUR HANDS', 1800);
+  }catch(err){
+    setCenterMsg('CAMERA ACCESS DENIED — ALLOW CAMERA & RELOAD', null);
+    console.error(err);
+  }
+}
+
+function setCenterMsg(txt, autoHideMs){
+  const el = document.getElementById('centerMsg');
+  el.textContent = txt;
+  el.style.opacity = '1';
+  if(autoHideMs){
+    clearTimeout(el._t);
+    el._t = setTimeout(()=>{ el.style.opacity='0'; }, autoHideMs);
+  }
+}
+
+/* ---------- MediaPipe callback ---------- */
+function onHandsResults(results){
+  if(!results.multiHandLandmarks){
+    latestHands = [];
+    return;
+  }
+  latestHands = results.multiHandLandmarks.map(lm => ({ lm }));
+}
+
+/* =========================================================
+   p5.js sketch (global mode)
+   ========================================================= */
+let W, H;
+let t = 0;
+
+function explodeAt(x,y){
+
+  for(let i=0;i<45;i++){
+
+    particles.push({
+      x:x,
+      y:y,
+      vx:(Math.random()-0.5)*10,
+      vy:(Math.random()-0.5)*10,
+      life:60,
+      size:2+Math.random()*4
+    });
+
+  }
+}
+
+function updateAndDrawParticles(){
+
+  for(let i=particles.length-1;i>=0;i--){
+
+    let p = particles[i];
+
+    p.x += p.vx;
+    p.y += p.vy;
+
+    p.vy += 0.05;
+    p.life--;
+
+    drawingContext.shadowBlur = 20;
+    drawingContext.shadowColor = "#00fff9";
+
+    fill(255,255,255,p.life*4);
+    noStroke();
+
+    circle(p.x,p.y,p.size);
+
+    if(p.life <= 0){
+      particles.splice(i,1);
+    }
+  }
+}
+
+function checkFingertipTouches(leftPts,rightPts){
+
+  FINGER_TIPS.forEach(li=>{
+
+    FINGER_TIPS.forEach(ri=>{
+
+      let p1 = leftPts[li];
+      let p2 = rightPts[ri];
+
+      let d = dist(
+        p1.x,p1.y,
+        p2.x,p2.y
+      );
+
+      let key = li+"_"+ri;
+
+      if(d < 26 && !touchCooldown[key]){
+
+        explodeAt(
+          (p1.x+p2.x)/2,
+          (p1.y+p2.y)/2
+        );
+
+        touchCooldown[key] = true;
+      }
+
+      if(d > 48){
+        touchCooldown[key] = false;
+      }
+
+    });
+
+  });
+}
+
+function setup(){
+  W = window.innerWidth; H = window.innerHeight;
+  cradleCanvas = createCanvas(W, H);
+  cradleCanvas.parent('cradleCanvasWrap');
+  pixelDensity(1);          // keep render cost flat regardless of device DPI
+  noStroke();
+  frameRate(60);
+}
+
+function windowResized(){
+  W = window.innerWidth; H = window.innerHeight;
+  resizeCanvas(W, H);
+}
+
+function draw(){
+  clear();           // transparent canvas, video shows through underneath
+  t += 1;
+
+  if(latestHands.length === 0){
+    updateHUD(null, null, null);
+    return;
+  }
+
+  // Map every detected hand's landmarks to mirrored screen space
+  const handsScreen = latestHands.map(h => ({
+    pts: h.lm.map(p => ({ x: (1 - p.x) * W, y: p.y * H, z: p.z }))
+  }));
+
+  // Decide left/right purely by on-screen x position (robust regardless of MediaPipe handedness label)
+  handsScreen.sort((a,b) => a.pts[0].x - b.pts[0].x);
+  const leftHand  = handsScreen[0];
+  const rightHand = handsScreen.length > 1 ? handsScreen[1] : null;
+
+  // Draw skeleton + glowing joints for every hand present
+  handsScreen.forEach(h => drawHandGlow(h.pts));
+
+  // Draw cat's-cradle strings only when both hands are visible
+  let tensionPct = null;
+  if(leftHand && rightHand){
+    
+
+  tensionPct = drawCradleStrings(
+    leftHand.pts,
+    rightHand.pts
+  );
+
+  checkFingertipTouches(
+    leftHand.pts,
+    rightHand.pts
+  );
+}
+
+  updateHUD(leftHand, rightHand, tensionPct);
+  updateAndDrawParticles();
+}
+
+/* ---------- joints + bones for a single hand ---------- */
+function drawHandGlow(pts){
+  const ctx = drawingContext;
+
+  // bones (thin glowing skeleton lines)
+  ctx.save();
+  ctx.shadowBlur = 10;
+  ctx.shadowColor = 'rgba(0,255,249,0.55)';
+  stroke(0,255,249,140);
+  strokeWeight(1.2);
+  HAND_BONES.forEach(([a,b]) => {
+    line(pts[a].x, pts[a].y, pts[b].x, pts[b].y);
+  });
+  ctx.restore();
+
+  // joints (neon dots, fingertips bigger & brighter)
+  pts.forEach((p, i) => {
+    const isTip = FINGER_TIPS.includes(i);
+    const col = PALETTE[fingerGroup(i)];
+    const r = isTip ? 8 : 4.5;
+    ctx.save();
+    ctx.shadowBlur = isTip ? 26 : 14;
+    ctx.shadowColor = col;
+    fill(col);
+    noStroke();
+    circle(p.x, p.y, r);
+    ctx.restore();
+
+    if(isTip){
+      // soft outer halo
+      ctx.save();
+      ctx.shadowBlur = 0;
+      fill(red(color(col)), green(color(col)), blue(color(col)), 40);
+      circle(p.x, p.y, r*2.8);
+      ctx.restore();
+    }
+  });
+}
+
+/* ---------- elastic strings between two hands ---------- */
+function drawCradleStrings(leftPts, rightPts){
+  const ctx = drawingContext;
+  const maxDist = Math.max(W,H) * 0.78;
+  const minDist = 50;
+
+  // pairings: 5 matching fingers + 2 crossing diagonals for a richer "cradle" weave
+  const pairs = [
+    [4,4],[8,8],[12,12],[16,16],[20,20],
+    [4,20],[20,4]
+  ];
+
+  let distances = [];
+
+  pairs.forEach(([li, ri], idx) => {
+    const p1 = leftPts[li];
+    const p2 = rightPts[ri];
+    const d = dist(p1.x, p1.y, p2.x, p2.y);
+    distances.push(d);
+
+    const tension = constrain(map(d, minDist, maxDist, 0, 1), 0, 1);
+    const slack = 1 - tension;
+
+    // colour: cyan (slack) -> magenta (mid) -> yellow (taut)
+    let col;
+    if(tension < 0.5){
+      col = lerpColor(color('#00fff9'), color('#ff00e6'), tension*2);
+    } else {
+      col = lerpColor(color('#ff00e6'), color('#fff700'), (tension-0.5)*2);
+    }
+
+    const thickness = map(tension, 0, 1, 7, 1.2);
+    const glow = map(tension, 0, 1, 14, 34);
+
+    // gentle elastic sag + wobble, stronger when slack
+    const wobble = Math.sin(t*0.07 + idx*1.7) * slack * 9;
+    const sagY = slack * 70 + wobble;
+    const midX = (p1.x + p2.x) / 2;
+    const midY = (p1.y + p2.y) / 2 + sagY;
+
+    ctx.save();
+    ctx.shadowBlur = glow;
+    ctx.shadowColor = col.toString();
+    stroke(col);
+    strokeWeight(thickness);
+    noFill();
+    beginShape();
+    vertex(p1.x, p1.y);
+    quadraticVertex(midX, midY, p2.x, p2.y);
+    endShape();
+    ctx.restore();
+
+    // travelling energy spark along the thread
+    const spark = (t*0.012 + idx*0.21) % 1;
+    const sp = quadPoint(p1, {x:midX,y:midY}, p2, spark);
+    ctx.save();
+    ctx.shadowBlur = 22;
+    ctx.shadowColor = col.toString();
+    fill(col);
+    noStroke();
+    circle(sp.x, sp.y, 4.5);
+    ctx.restore();
+  });
+
+  const avgDist = distances.reduce((a,b)=>a+b,0) / distances.length;
+  return Math.round(constrain(map(avgDist, minDist, maxDist, 0, 100), 0, 100));
+}
+
+function quadPoint(p0, p1, p2, tt){
+  const x = (1-tt)*(1-tt)*p0.x + 2*(1-tt)*tt*p1.x + tt*tt*p2.x;
+  const y = (1-tt)*(1-tt)*p0.y + 2*(1-tt)*tt*p1.y + tt*tt*p2.y;
+  return {x,y};
+}
+
+/* ---------- HUD (throttled DOM writes for performance) ---------- */
+let lastHudWrite = 0;
+function updateHUD(left, right, tensionPct){
+  if(t - lastHudWrite < 6) return;
+  lastHudWrite = t;
+
+  const statL = document.getElementById('statL');
+  const statR = document.getElementById('statR');
+  const statT = document.getElementById('statT');
+
+  statL.textContent = left  ? 'L-HAND :: LOCKED'    : 'L-HAND :: SEARCHING';
+  statL.className   = left  ? 'ok' : 'wait';
+  statR.textContent = right ? 'R-HAND :: LOCKED'    : 'R-HAND :: SEARCHING';
+  statR.className   = right ? 'ok' : 'wait';
+
+  if(tensionPct !== null){
+    statT.textContent = 'TENSION :: ' + tensionPct + '%';
+    statT.className = 'ok';
+    document.getElementById('centerMsg').style.opacity = '0';
+  } else {
+    statT.textContent = 'TENSION :: --';
+    statT.className = 'wait';
+    if(left || right){
+      setCenterMsg('NEED BOTH HANDS TO WEAVE THE THREAD', null);
+    } else if(started){
+      setCenterMsg('SHOW BOTH HANDS TO THE CAMERA', null);
+    }
+  }
+  started = true;
+}
+</script>
+</body>
+</html>
